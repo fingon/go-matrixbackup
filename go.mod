@@ -5,11 +5,13 @@ go 1.24.2
 require (
 	github.com/alecthomas/kong v1.10.0
 	github.com/rs/zerolog v1.34.0
+	gotest.tools/v3 v3.5.2
 	maunium.net/go/mautrix v0.23.3
 )
 
 require (
 	filippo.io/edwards25519 v1.1.0 // indirect
+	github.com/google/go-cmp v0.6.0 // indirect
 	github.com/mattn/go-colorable v0.1.14 // indirect
 	github.com/mattn/go-isatty v0.0.20 // indirect
 	github.com/tidwall/gjson v1.18.0 // indirect
