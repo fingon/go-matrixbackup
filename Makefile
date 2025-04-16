@@ -4,7 +4,7 @@
 # Copyright (c) 2025 Markus Stenberg
 #
 # Created:       Sun Apr 13 08:23:25 2025 mstenber
-# Last modified: Sun Apr 13 08:52:04 2025 mstenber
+# Last modified: Wed Apr 16 17:01:26 2025 mstenber
 # Edit time:     2 min
 #
 #
@@ -22,8 +22,3 @@ test:
 .PHONY: lint
 lint:
 	golangci-lint run --fix  # Externally installed, e.g. brew
-
-
-.PHONY: references
-references:
-	rsync -a ~/share/1/rfcs/rfc{6206,7787}.txt reference
