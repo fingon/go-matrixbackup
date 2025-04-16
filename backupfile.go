@@ -65,12 +65,8 @@ func processEvents(roomPath string, events []*event.Event) error {
 	}
 
 	for dateStr, dailyEvents := range eventsByDate {
-		datePath := filepath.Join(roomPath, dateStr)
-		if err := os.MkdirAll(datePath, 0o755); err != nil {
-			return fmt.Errorf("failed to create date directory %s: %w", datePath, err)
-		}
-
-		dataPath := filepath.Join(datePath, dataFilename)
+		// Construct the path for the daily JSON file directly in the room directory
+		dataPath := filepath.Join(roomPath, dateStr+".json")
 
 		// Read existing data if file exists
 		var existingEvents []*event.Event
@@ -106,6 +102,11 @@ func processEvents(roomPath string, events []*event.Event) error {
 		sort.SliceStable(finalEvents, func(i, j int) bool {
 			return finalEvents[i].Timestamp < finalEvents[j].Timestamp
 		})
+
+		// Ensure the room directory exists before writing the file
+		if err := os.MkdirAll(roomPath, 0o755); err != nil {
+			return fmt.Errorf("failed to create room directory %s: %w", roomPath, err)
+		}
 
 		// Marshal and write the merged and sorted data
 		mergedData, err := json.MarshalIndent(finalEvents, "", "  ")

@@ -95,10 +95,9 @@ func TestProcessEvents(t *testing.T) {
 		newTestEvent("$evt1", ts1, "Hello"), // Duplicate event
 	}
 
-	datePath1 := filepath.Join(roomPath, "2024-01-15")
-	dataPath1 := filepath.Join(datePath1, dataFilename)
-	datePath2 := filepath.Join(roomPath, "2024-01-16")
-	dataPath2 := filepath.Join(datePath2, dataFilename)
+	// Define expected file paths directly in the room directory
+	dataPath1 := filepath.Join(roomPath, "2024-01-15.json")
+	dataPath2 := filepath.Join(roomPath, "2024-01-16.json")
 
 	t.Run("First batch", func(t *testing.T) {
 		err := processEvents(roomPath, events1)
@@ -162,9 +161,10 @@ func TestProcessEvents(t *testing.T) {
 	t.Run("Handle corrupted existing data file", func(t *testing.T) {
 		// Reset
 		_ = os.RemoveAll(roomPath)
-		// Create a corrupted file for 2024-01-15
-		err := os.MkdirAll(datePath1, 0o755)
+		// Ensure room path exists for writing the corrupted file
+		err := os.MkdirAll(roomPath, 0o755)
 		assert.NilError(t, err)
+		// Create a corrupted file for 2024-01-15 directly in roomPath
 		err = os.WriteFile(dataPath1, []byte("[{invalid json"), 0o644)
 		assert.NilError(t, err)
 
