@@ -2,10 +2,12 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"github.com/rs/zerolog"
@@ -108,9 +110,16 @@ func backupRoom(ctx context.Context, logger zerolog.Logger, client *mautrix.Clie
 	roomPath := filepath.Join(cli.BackupDir, roomDirName)
 	roomLog = roomLog.With().Str("room_dir", roomDirName).Logger()
 
+	// Ensure the target directory exists before potentially merging into it
 	if err := os.MkdirAll(roomPath, 0o755); err != nil {
 		roomLog.Error().Str("path", roomPath).Err(err).Msg("Failed to create room directory, skipping room")
 		return err
+	}
+
+	// Merge data from any old directories for the same room ID
+	if err := mergeOldRoomData(cli.BackupDir, roomID, roomDirName, roomPath, roomLog); err != nil {
+		// Log the error but continue, as merging is best-effort
+		roomLog.Warn().Err(err).Msg("Failed to merge data from old room directories")
 	}
 
 	meta, err := readMetadata(roomPath)
@@ -131,6 +140,149 @@ func backupRoom(ctx context.Context, logger zerolog.Logger, client *mautrix.Clie
 	if totalFetched > 0 {
 		roomLog.Info().Int("total_fetched", totalFetched).Msg("Room backup finished")
 	}
+	return nil
+}
+
+// mergeOldRoomData finds directories in backupDir belonging to the same roomID but potentially
+// different sanitized names, merges their event data into targetRoomPath, and removes the old directories.
+func mergeOldRoomData(backupDir string, roomID id.RoomID, currentRoomDirName, targetRoomPath string, roomLog zerolog.Logger) error {
+	roomIDStr := roomID.String()
+	dirEntries, err := os.ReadDir(backupDir)
+	if err != nil {
+		// If we can't read the backup dir, we can't merge, but it might not exist yet.
+		if os.IsNotExist(err) {
+			return nil // Nothing to merge from
+		}
+		return fmt.Errorf("failed to read backup directory %s: %w", backupDir, err)
+	}
+
+	var mergeErrors []error
+	for _, entry := range dirEntries {
+		if !entry.IsDir() {
+			continue
+		}
+		dirName := entry.Name()
+
+		// Find the index of the ":!" separator which marks the start of the room ID.
+		// This reliably separates the sanitized name from the actual room ID.
+		separatorIndex := strings.LastIndex(dirName, ":!")
+
+		// Check if the ":!" separator was found.
+		if separatorIndex == -1 {
+			continue
+		}
+		// Extract the potential room ID part (starts from the '!')
+		extractedRoomID := dirName[separatorIndex+1:]
+
+		// Check if the extracted ID matches the current room ID
+		// AND that this isn't the directory we are currently processing.
+		if extractedRoomID != roomIDStr || dirName == currentRoomDirName {
+			continue
+		}
+
+		// This directory belongs to the same room but has a different name prefix. Merge it.
+		err := processSingleOldDirectory(backupDir, dirName, targetRoomPath, roomLog)
+		if err != nil {
+			// Log the error from processing the single directory and add it to the list
+			roomLog.Error().Err(err).Str("old_dir", dirName).Msg("Failed to process old directory")
+			mergeErrors = append(mergeErrors, err) // Add the specific error from the function
+		}
+	}
+
+	if len(mergeErrors) > 0 {
+		// Combine multiple errors into one
+		errorMessages := make([]string, len(mergeErrors))
+		for i, e := range mergeErrors {
+			errorMessages[i] = e.Error()
+		}
+		return errors.New("encountered errors during merge: " + strings.Join(errorMessages, "; "))
+	}
+
+	return nil
+}
+
+// processSingleOldDirectory reads events from a specific old directory, processes them into the target path,
+// and removes the old directory. It returns an error if any step fails critically.
+func processSingleOldDirectory(backupDir, oldDirName, targetRoomPath string, roomLog zerolog.Logger) error {
+	oldDirPath := filepath.Join(backupDir, oldDirName)
+	roomLog.Info().Str("old_dir", oldDirName).Msg("Found old directory for the same room, merging data")
+
+	files, err := os.ReadDir(oldDirPath)
+	if err != nil {
+		// Log here, but return a wrapped error for the caller
+		roomLog.Error().Err(err).Str("path", oldDirPath).Msg("Failed to read old directory")
+		return fmt.Errorf("failed to read old dir %s: %w", oldDirName, err)
+	}
+
+	var allEvents []*event.Event
+	var fileReadErrors []error
+	for _, file := range files {
+		// Skip subdirectories and the metadata file within the old directory
+		if file.IsDir() || file.Name() == metadataFilename {
+			continue
+		}
+		// Only process JSON files (assuming event data files end with .json)
+		if !strings.HasSuffix(file.Name(), ".json") {
+			roomLog.Debug().Str("file", file.Name()).Msg("Skipping non-JSON file in old directory")
+			continue
+		}
+
+		filePath := filepath.Join(oldDirPath, file.Name())
+		data, err := os.ReadFile(filePath)
+		if err != nil {
+			roomLog.Error().Err(err).Str("path", filePath).Msg("Failed to read file from old directory, skipping file")
+			fileReadErrors = append(fileReadErrors, fmt.Errorf("failed to read file %s in old dir %s: %w", file.Name(), oldDirName, err))
+			continue // Skip this file, try others
+		}
+
+		var events []*event.Event
+		if err := json.Unmarshal(data, &events); err != nil {
+			roomLog.Error().Err(err).Str("path", filePath).Msg("Failed to unmarshal events from old file, skipping file")
+			fileReadErrors = append(fileReadErrors, fmt.Errorf("failed to unmarshal %s in old dir %s: %w", file.Name(), oldDirName, err))
+			continue // Skip this file, try others
+		}
+		allEvents = append(allEvents, events...)
+	}
+
+	// Log accumulated file read/unmarshal errors, but proceed if we have any events
+	if len(fileReadErrors) > 0 {
+		errorMessages := make([]string, len(fileReadErrors))
+		for i, e := range fileReadErrors {
+			errorMessages[i] = e.Error()
+		}
+		roomLog.Warn().Str("old_dir", oldDirName).Msg("Encountered errors reading files in old directory: " + strings.Join(errorMessages, "; "))
+	}
+
+	if len(allEvents) > 0 {
+		roomLog.Debug().Int("count", len(allEvents)).Str("old_dir", oldDirName).Msg("Processing merged events from old directory")
+		if err := processEvents(targetRoomPath, allEvents); err != nil {
+			roomLog.Error().Err(err).Str("old_dir", oldDirName).Msg("Failed to process merged events from old directory")
+			// Return this error, as failure to process means we shouldn't remove the old dir
+			// Combine processing error with any previous file read errors for a comprehensive error message
+			combinedError := fmt.Errorf("failed to process events from old dir %s: %w", oldDirName, err)
+			if len(fileReadErrors) > 0 {
+				errorMessages := make([]string, len(fileReadErrors))
+				for i, e := range fileReadErrors {
+					errorMessages[i] = e.Error()
+				}
+				combinedError = fmt.Errorf("%w; also encountered file read errors: %s", combinedError, strings.Join(errorMessages, "; "))
+			}
+			return combinedError
+		}
+	} else {
+		roomLog.Debug().Str("old_dir", oldDirName).Msg("No valid event files found in old directory to merge")
+	}
+
+	// Only remove the old directory if processing succeeded (or there was nothing to process)
+	roomLog.Info().Str("old_dir", oldDirName).Msg("Removing old directory after merging")
+	if err := os.RemoveAll(oldDirPath); err != nil {
+		roomLog.Error().Err(err).Str("path", oldDirPath).Msg("Failed to remove old directory after merging")
+		// Return this error, but processing was successful
+		return fmt.Errorf("failed to remove old dir %s after merging: %w", oldDirName, err)
+	}
+
+	// If we had file read errors but processing succeeded and removal succeeded, return nil
+	// The warnings about file read errors have already been logged.
 	return nil
 }
 
