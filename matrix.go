@@ -5,9 +5,13 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
+	"net"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/rs/zerolog"
@@ -17,7 +21,8 @@ import (
 )
 
 const (
-	fetchLimit = 100 // Number of messages to fetch per request
+	fetchLimit                 = 100 // Number of messages to fetch per request
+	matrixConnectionRetryDelay = 10 * time.Second
 )
 
 // getRoomName tries to find a human-readable name for the room.
@@ -287,34 +292,86 @@ func processSingleOldDirectory(backupDir, oldDirName, targetRoomPath string, roo
 }
 
 // initializeMatrixClient creates and verifies the Matrix client connection.
+// initializeMatrixClient creates and verifies the Matrix client connection.
+// It will retry the Whoami call if network errors or specific server errors occur.
 func initializeMatrixClient(cli *CLI, logger zerolog.Logger) (*mautrix.Client, error) {
-	logger.Info().Msg("Initializing Matrix client...")
+	logger.Info().Msg("Initializing Matrix client instance...")
 	client, err := mautrix.NewClient(cli.Server, id.UserID(cli.User), cli.Token)
 	if err != nil {
-		// Log details before returning wrapped error
-		logger.Error().Err(err).Msg("Failed to create Matrix client")
-		return nil, fmt.Errorf("failed to create Matrix client: %w", err)
+		logger.Error().Err(err).Msg("Failed to create Matrix client instance (config issue?)")
+		return nil, fmt.Errorf("failed to create Matrix client instance: %w", err) // Non-retryable
 	}
 	client.DeviceID = id.DeviceID(cli.DeviceID)
 	client.Store = mautrix.NewMemorySyncStore() // We don't need sync store for backup
 
-	whoami, err := client.Whoami(context.Background())
-	if err != nil {
-		// Log details before returning wrapped error
-		logger.Error().Err(err).Msg("Failed to verify credentials (whoami failed)")
-		// Attempt to provide more context if it's an HTTP error
+	logger.Info().Msg("Verifying credentials with Whoami call...")
+	retryCount := 0
+	for {
+		whoami, err := client.Whoami(context.Background())
+		if err == nil {
+			logger.Info().Str("user_id", whoami.UserID.String()).Str("device_id", whoami.DeviceID.String()).Msg("Successfully logged in (Whoami successful)")
+			if cli.DeviceID != "" && whoami.DeviceID != id.DeviceID(cli.DeviceID) {
+				logger.Warn().Str("expected", cli.DeviceID).Str("actual", string(whoami.DeviceID)).Msg("Logged in with different device ID than specified")
+			}
+			client.DeviceID = whoami.DeviceID // Use actual device ID from whoami response
+			return client, nil
+		}
+
+		// Whoami failed, log and check if retryable
+		logAttempt := logger.With().Err(err).Int("attempt", retryCount+1).Logger()
+		logAttempt.Error().Msg("Failed to verify credentials (Whoami failed)")
+
 		var httpErr mautrix.HTTPError
 		if errors.As(err, &httpErr) {
-			logger.Error().Int("status_code", httpErr.Response.StatusCode).Interface("resp_error", httpErr.RespError).Msg("Whoami HTTP error details")
+			if httpErr.Response != nil {
+				logAttempt.Error().Int("status_code", httpErr.Response.StatusCode).Interface("resp_error", httpErr.RespError).Msg("Whoami HTTP error details")
+			} else {
+				logAttempt.Error().Interface("resp_error", httpErr.RespError).Msg("Whoami HTTP error details (no response object, no underlying error specified in httpErr.Err)")
+			}
 		}
-		return nil, fmt.Errorf("failed to verify credentials (whoami failed): %w", err)
+
+		isRetryable := false
+		var urlErr *url.Error
+		var netOpErr *net.OpError
+
+		switch {
+		case errors.As(err, &urlErr):
+			if errors.Is(urlErr.Err, io.EOF) || errors.Is(urlErr.Err, syscall.ECONNREFUSED) || strings.Contains(strings.ToLower(urlErr.Err.Error()), "timed out") || strings.Contains(strings.ToLower(urlErr.Err.Error()), "no such host") {
+				isRetryable = true
+			}
+		case errors.As(err, &netOpErr):
+			errString := strings.ToLower(netOpErr.Err.Error())
+			if errors.Is(netOpErr.Err, syscall.ECONNREFUSED) || strings.Contains(errString, "connection refused") || strings.Contains(errString, "no such host") || strings.Contains(errString, "network is unreachable") {
+				isRetryable = true
+			}
+		case errors.Is(err, io.EOF):
+			isRetryable = true
+		}
+
+		if errors.As(err, &httpErr) && httpErr.Response != nil {
+			// Override retryable status based on HTTP status codes
+			// 4xx client errors (except 429 Too Many Requests) are generally not retryable.
+			// 5xx server errors might be temporary and thus retryable.
+			if httpErr.Response.StatusCode >= 400 && httpErr.Response.StatusCode < 500 && httpErr.Response.StatusCode != 429 {
+				isRetryable = false
+			} else if httpErr.Response.StatusCode >= 500 || httpErr.Response.StatusCode == 429 {
+				isRetryable = true
+			}
+		}
+
+		if isRetryable {
+			if cli.MaxWhoamiRetries > 0 && retryCount >= cli.MaxWhoamiRetries-1 { // -1 because retryCount is 0-indexed
+				logAttempt.Error().Int("max_retries", cli.MaxWhoamiRetries).Msg("Reached max retries for Whoami. Giving up.")
+				return nil, fmt.Errorf("failed to verify credentials after %d retries (Whoami failed): %w", cli.MaxWhoamiRetries, err)
+			}
+			logAttempt.Info().Dur("retry_delay", matrixConnectionRetryDelay).Msg("Server unavailable or network issue during Whoami. Retrying after delay...")
+			time.Sleep(matrixConnectionRetryDelay)
+			retryCount++
+		} else {
+			logAttempt.Error().Msg("Non-retryable error during Whoami. Will not retry.")
+			return nil, fmt.Errorf("failed to verify credentials (Whoami failed with non-retryable error): %w", err)
+		}
 	}
-	logger.Info().Str("user_id", whoami.UserID.String()).Str("device_id", whoami.DeviceID.String()).Msg("Successfully logged in")
-	if cli.DeviceID != "" && whoami.DeviceID != id.DeviceID(cli.DeviceID) {
-		logger.Warn().Str("expected", cli.DeviceID).Str("actual", string(whoami.DeviceID)).Msg("Logged in with different device ID than specified")
-	}
-	client.DeviceID = whoami.DeviceID // Use actual device ID from whoami response
-	return client, nil
 }
 
 // backupJoinedRooms fetches the list of joined rooms and initiates backup for each.
