@@ -23,9 +23,9 @@ type CLI struct {
 
 	// Other options
 	BackupDir string `kong:"name='dir',default='./backup',help='Directory to store backups.',group='Options'"`
-	Debug     bool   `kong:"name='debug',help='Enable debug logging.'"`
-	LogJSON   bool   `kong:"name='log-json',help='Output logs in JSON format.'"`
-	Color     bool   `kong:"name='log-color',help='Color logs.'"`
+	LogLevel  string `kong:"name='log-level',default='info',enum='trace,debug,info,warn,error,fatal,panic',help='Set the logging level (trace, debug, info, warn, error, fatal, panic).',group='Logging'"`
+	LogJSON   bool   `kong:"name='log-json',help='Output logs in JSON format.',group='Logging'"`
+	Color     bool   `kong:"name='log-color',help='Color logs.',group='Logging'"`
 }
 
 func main() {

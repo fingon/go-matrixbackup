@@ -10,9 +10,11 @@ import (
 
 // setupLogging configures the global logger based on CLI flags.
 func setupLogging(cli *CLI) zerolog.Logger {
-	logLevel := zerolog.InfoLevel
-	if cli.Debug {
-		logLevel = zerolog.DebugLevel
+	logLevel, err := zerolog.ParseLevel(cli.LogLevel)
+	if err != nil {
+		// If parsing fails, default to InfoLevel and log a warning.
+		logLevel = zerolog.InfoLevel
+		log.Warn().Str("provided_level", cli.LogLevel).Msg("Invalid log level specified, defaulting to 'info'")
 	}
 	zerolog.SetGlobalLevel(logLevel)
 	zerolog.TimeFieldFormat = zerolog.TimeFormatUnixMs // Use milliseconds for timestamp
