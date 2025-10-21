@@ -21,7 +21,6 @@ import (
 )
 
 const (
-	fetchLimit                 = 100 // Number of messages to fetch per request
 	matrixConnectionRetryDelay = 10 * time.Second
 )
 
@@ -59,11 +58,15 @@ func fetchAndProcessRoomMessages(ctx context.Context, client *mautrix.Client, ro
 	currentToken := initialToken
 	fetchDirection := mautrix.DirectionForward
 	totalFetched := 0
+	var accumulatedEvents []*event.Event // Accumulator for all events fetched in this run
+
 	for {
-		roomLog.Debug().Str("direction", string(fetchDirection)).Str("token", currentToken).Int("limit", fetchLimit).Msg("Fetching messages")
-		resp, err := client.Messages(ctx, roomID, currentToken, "", fetchDirection, nil, fetchLimit)
+		roomLog.Debug().Str("direction", string(fetchDirection)).Str("token", currentToken).Int("limit", cli.FetchLimit).Msg("Fetching messages")
+		resp, err := client.Messages(ctx, roomID, currentToken, "", fetchDirection, nil, cli.FetchLimit)
 		if err != nil {
 			roomLog.Error().Err(err).Msg("Failed to fetch messages")
+			// If an error occurs during fetching, we return immediately.
+			// Any events accumulated so far will not be processed in this run.
 			return currentToken, totalFetched, err
 		}
 
@@ -74,10 +77,8 @@ func fetchAndProcessRoomMessages(ctx context.Context, client *mautrix.Client, ro
 
 		roomLog.Debug().Int("count", len(resp.Chunk)).Str("start_token", resp.Start).Str("end_token", resp.End).Msg("Fetched message chunk")
 
-		if err := processEvents(roomPath, resp.Chunk); err != nil {
-			roomLog.Error().Err(err).Msg("Failed to process message chunk")
-			return currentToken, totalFetched, err
-		}
+		// Accumulate events instead of processing them immediately
+		accumulatedEvents = append(accumulatedEvents, resp.Chunk...)
 		totalFetched += len(resp.Chunk)
 
 		nextToken := resp.End
@@ -91,6 +92,18 @@ func fetchAndProcessRoomMessages(ctx context.Context, client *mautrix.Client, ro
 		// Small delay to avoid hammering the server
 		time.Sleep(cli.FetchDelay)
 	}
+
+	// Process all accumulated events at once after fetching is complete
+	if len(accumulatedEvents) > 0 {
+		roomLog.Info().Int("total_events_to_process", len(accumulatedEvents)).Msg("Processing all accumulated events")
+		if err := processEvents(roomPath, accumulatedEvents); err != nil {
+			roomLog.Error().Err(err).Msg("Failed to process all accumulated message chunks")
+			return currentToken, totalFetched, err
+		}
+	} else {
+		roomLog.Debug().Msg("No new events accumulated to process.")
+	}
+
 	return currentToken, totalFetched, nil
 }
 

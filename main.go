@@ -19,6 +19,7 @@ type CLI struct {
 	ConfigFile string `kong:"name='config',type='path',default='~/.config/matrix-commander/credentials.json',help='Path to a JSON file containing credentials (server, user, token, device_id). Default: ~/.config/matrix-commander/credentials.json',group='Credentials'"`
 
 	FetchDelay       time.Duration `default:"10ms" help:"Delay between requests"`
+	FetchLimit       int           `kong:"name='fetch-limit',default='100',help='Number of messages to fetch per request.',group='Options'"`
 	MaxWhoamiRetries int           `kong:"name='max-whoami-retries',default='0',help='Maximum number of retries for the initial Whoami check (0 for infinite).',group='Options'"`
 
 	// Other options
